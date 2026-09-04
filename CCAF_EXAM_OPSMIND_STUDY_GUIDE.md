@@ -96,6 +96,23 @@ flowchart TB
     HELM --- TF
 ```
 
+#### Code behind this diagram
+
+The diagram is assembled from real runtime entry points. The root scripts show that the portal, incident service, AI orchestrator, and MCP server are separate processes:
+
+```json
+{
+  "scripts": {
+    "incident:start": "npm --prefix services/incident-service run start",
+    "ai:start": "npm --prefix services/ai-orchestrator run start",
+    "mcp:start": "npm --prefix services/mcp-server run start:http",
+    "web:build": "npm --prefix apps/web-portal run build"
+  }
+}
+```
+
+Used in: `package.json`. The API Gateway is the edge layer, the Incident Service owns incident state, and the AI Orchestrator connects reasoning providers to MCP/RAG/observability. Deployment definitions are under `docker-compose.yml`, `infrastructure/kubernetes`, `helm`, and `infrastructure/terraform`.
+
 ### 2.2 Logical agents versus deployed services
 
 The folders under `agents/` make responsibilities readable. They do **not** represent five separately deployed autonomous services. Runtime orchestration lives mainly in `services/ai-orchestrator`, `services/mcp-server`, `services/incident-service`, and `services/integrations-service`.
@@ -145,6 +162,38 @@ sequenceDiagram
     C-->>SRE: Facts, hypothesis, confidence, remediation, audit metadata
 ```
 
+#### Code behind this sequence
+
+The controller receives the incident, objective, and the caller's explicit write approvals:
+
+```ts
+const approvedTools = new Set<string>(
+  Array.isArray(req.body?.approvedTools)
+    ? req.body.approvedTools.filter(
+        (value: unknown): value is string => typeof value === "string",
+      )
+    : [],
+);
+
+const result = await automateIncident(
+  incidentNumber,
+  objective,
+  approvedTools,
+);
+```
+
+Used in: `services/ai-orchestrator/src/controllers/agentController.ts`. The set is passed to the automation service. Reads can proceed, but the persistence tool is approved only when its exact name is present:
+
+```ts
+return provider.callWithTools(systemPrompt, objective, incidentTools, {
+  maxIterations: 8,
+  maxTokens: 4096,
+  approve: async ({ tool }) => approvedTools.has(tool),
+});
+```
+
+Used in: `services/ai-orchestrator/src/services/opsIncidentAutomationService.ts`. This implements the sequence diagram's approval branch and bounds the loop.
+
 The key architectural idea is: **the model reasons; application code governs; services own authoritative state.**
 
 ---
@@ -167,6 +216,32 @@ flowchart LR
     MODEL -->|end_turn| DONE[Return final answer]
     MODEL -->|max turns/time/cost| STOP[Safe bounded stop]
 ```
+
+#### Code behind the agent loop
+
+OpsMind constructs narrow tools with a strict object schema and an executor that routes through MCP:
+
+```ts
+function mcpTool(name, description, properties, required, requiresApproval = false) {
+  return {
+    name,
+    description,
+    inputSchema: {
+      type: "object",
+      properties,
+      required,
+      additionalProperties: false,
+    },
+    requiresApproval,
+    execute: async (input) => {
+      const response = await callMcpTool(name, input);
+      return { transport: response.transport, data: response.data };
+    },
+  };
+}
+```
+
+Used in: `services/ai-orchestrator/src/services/opsIncidentAutomationService.ts`. `ClaudeProvider.callWithTools()` then repeatedly sends conversation history, validates requested inputs, executes or denies tools, appends tool results, and exits on the response's stop condition or the iteration limit.
 
 The host must preserve the assistant tool request and matching tool result in conversation history. It must inspect the API termination signal rather than guess that the workflow has ended.
 
@@ -198,6 +273,30 @@ flowchart TD
     GATE -->|No| ADVISE[Recommendation only]
     GATE -->|Yes| APPLY[Bounded action + validation + rollback]
 ```
+
+#### Code behind coordinator and specialists
+
+The Claude Agent SDK configuration defines specialists with purpose-specific, read-only tools:
+
+```ts
+function defaultSubagents(): Record<string, AgentDefinition> {
+  return {
+    "sre-investigator": {
+      description: "Investigates incidents using read-only code and configuration access.",
+      prompt: "Analyze evidence, cite exact files and observations, and never change repository state.",
+      tools: ["Read", "Glob", "Grep"],
+      model: "sonnet",
+    },
+    "test-reviewer": {
+      description: "Reviews test coverage and proposes deterministic tests.",
+      tools: ["Read", "Glob", "Grep"],
+      model: "haiku",
+    },
+  };
+}
+```
+
+Used in: `services/ai-orchestrator/src/services/claudeAgentSdkService.ts`. This is a concrete least-privilege specialist design: specialists inspect and return evidence; the parent run owns the final result and permission decision.
 
 A good handoff contains:
 
@@ -273,6 +372,27 @@ flowchart LR
     OUT --> C
 ```
 
+#### Code behind tool validation and authorization
+
+The persistence tool explicitly marks approval as required:
+
+```ts
+mcpTool(
+  "update_incident_ai_insights",
+  "Persist approved root cause, remediation, and preventive actions.",
+  {
+    incident_number: { type: "string" },
+    root_cause: { type: "string" },
+    remediation: { type: "string" },
+    preventive_actions: { type: "string" },
+  },
+  ["incident_number", "root_cause", "remediation", "preventive_actions"],
+  true,
+);
+```
+
+Used in: `services/ai-orchestrator/src/services/opsIncidentAutomationService.ts`. Schema validation checks shape; the approval callback separately checks authority. This separation is an important exam principle.
+
 Strong tool design:
 
 - Uses a precise verb-noun name such as `get_incident_details`.
@@ -317,6 +437,39 @@ flowchart LR
     SERVER -->|content + isError| HOST
 ```
 
+#### Code behind the MCP server
+
+The actual FastMCP read tool combines a precise description, schema, safety annotations, execution, and a protocol-visible error:
+
+```ts
+export const getIncidentDetailsTool: Tool<FastMCPSessionAuth, typeof incidentNumberParams> = {
+  name: "get_incident_details",
+  description: "Retrieve full details of an incident by its incident number (e.g. INC-0001).",
+  annotations: {
+    title: "Get Incident Details",
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: true,
+  },
+  parameters: incidentNumberParams,
+  execute: async (args, context) => {
+    const n = resolveIncidentNumber(args);
+    context.log.info("get_incident_details called", { incidentNumber: n });
+    const result = await getIncidentDetails(n);
+    if (!result.success) {
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        isError: true,
+      };
+    }
+    return JSON.stringify(result, null, 2);
+  },
+};
+```
+
+Used in: `services/mcp-server/src/fastmcp/tools/incidentTools.ts`. The complete file registers the seven incident tools. Resources and reusable prompts are registered from `fastmcp/resources` and `fastmcp/prompts`.
+
 OpsMind prefers a configured remote streamable-HTTP gateway and can fall back to the local stdio MCP server. Secrets are supplied through runtime environment variables and must not be checked into configuration.
 
 ## 4.4 Tool error policy
@@ -332,6 +485,29 @@ flowchart TD
     OK -->|No| FALLBACK[Alternate provider/transport or graceful failure]
     OK -->|Yes| CONT[Continue]
 ```
+
+#### Code behind retry classification
+
+OpsMind retries only errors likely to be transient and caps the number of attempts:
+
+```ts
+const retryable =
+  status === 0 || [408, 409, 429].includes(status) || status >= 500;
+
+if (!retryable || attempt === this.maxRetries) {
+  throw error;
+}
+
+const exponentialDelay = this.retryBaseDelayMs * 2 ** attempt;
+const serverDelay = getServerRetryDelayMs(error) ?? 0;
+const delayMs = Math.min(
+  Math.max(exponentialDelay, serverDelay),
+  this.maxRetryDelayMs,
+);
+await sleep(delayMs);
+```
+
+Used in: `services/ai-orchestrator/src/providers/claudeProvider.ts`. Validation and permission errors are not made retryable because another attempt cannot fix missing authority or an invalid contract.
 
 An MCP tool should return a failed tool result (`isError`) for domain/dependency failures so the model can reason about the failure. Protocol breakage is different from a normal tool-level error.
 
@@ -370,6 +546,29 @@ flowchart TB
     ENT --> USER --> ROOT --> NEST --> TASK
 ```
 
+#### Project files behind the instruction layers
+
+The root instruction file directs repository-wide work and explicitly delegates narrower rules:
+
+```md
+# CLAUDE.md
+
+Read a nested `CLAUDE.md` when working in a component that contains one.
+```
+
+The MCP component then adds rules that apply only to that service:
+
+```md
+# services/mcp-server/CLAUDE.md
+
+- Keep every tool description and JSON input schema accurate and discoverable.
+- Mark tools with correct read-only, destructive and idempotency annotations.
+- New write tools require an explicit approval design and audit consideration.
+- Preserve both Streamable HTTP and stdio transports.
+```
+
+This is why the diagram narrows from enterprise/project instructions toward component and task context. A developer working only on the portal should not have MCP implementation detail consuming attention.
+
 OpsMind examples:
 
 - Root `CLAUDE.md` explains the repository and requires reading nested instructions.
@@ -390,6 +589,23 @@ flowchart LR
     R -->|issue found| X
     R -->|clean| D[Deliver]
 ```
+
+#### Commands behind the workflow
+
+OpsMind provides deterministic validation commands instead of asking the model to guess whether a change works:
+
+```json
+{
+  "scripts": {
+    "validate:deployment": "node scripts/validate-deployment.mjs",
+    "validate:claude-config": "node scripts/validate-claude-config.mjs",
+    "test:acceptance": "node --test scripts/live-acceptance.test.mjs",
+    "build": "npm run incident:build && npm run ai:build && npm run mcp:build && npm run web:build"
+  }
+}
+```
+
+Used in: `package.json`. In an exam answer, Claude can explore and propose, but builds and tests provide deterministic evidence for review.
 
 Use direct execution for a narrow, reversible, obvious change. Use planning for ambiguous requirements, multi-service changes, security-sensitive behavior, migrations, or unfamiliar architecture. Planning is a risk control, not ceremony.
 
@@ -413,6 +629,29 @@ flowchart LR
     GATE -->|No| COMMENT[Advisory comment]
     GATE -->|Yes| HUMAN[Human confirmation / protected gate]
 ```
+
+#### Code behind least-privilege Claude Code execution
+
+The SDK run automatically permits only read tools and requires an explicit callback for writes:
+
+```ts
+const READ_ONLY_TOOLS = new Set(["Read", "Glob", "Grep", "WebSearch", "WebFetch"]);
+
+canUseTool: async (toolName, input) => {
+  if (READ_ONLY_TOOLS.has(toolName)) return { behavior: "allow" };
+
+  const approved = Boolean(await options.approve?.(toolName, input));
+  return approved
+    ? { behavior: "allow", decisionClassification: "user_temporary" }
+    : {
+        behavior: "deny",
+        message: `Tool ${toolName} requires explicit approval`,
+        decisionClassification: "user_reject",
+      };
+},
+```
+
+Used in: `services/ai-orchestrator/src/services/claudeAgentSdkService.ts`. Pre/post-tool and subagent lifecycle hooks in the same file write audit events.
 
 Production rules:
 
@@ -469,6 +708,38 @@ flowchart LR
     BUS -->|ambiguous/high risk| HUMAN[Human review]
     FIX --> GEN
 ```
+
+#### Code behind structured validation
+
+The Agent SDK can require the final response to match a supplied JSON schema:
+
+```ts
+...(options.outputSchema
+  ? {
+      outputFormat: {
+        type: "json_schema" as const,
+        schema: options.outputSchema,
+      },
+    }
+  : {}),
+```
+
+Used in: `services/ai-orchestrator/src/services/claudeAgentSdkService.ts`. Tool calls receive a second application-side validator:
+
+```ts
+for (const field of schema.required ?? []) {
+  if (!(field in value)) {
+    throw new Error(`Missing required tool input: ${field}`);
+  }
+}
+
+if (schema.additionalProperties === false) {
+  const unknown = Object.keys(value).find((field) => !(field in properties));
+  if (unknown) throw new Error(`Unknown tool input: ${unknown}`);
+}
+```
+
+Used in: `services/ai-orchestrator/src/services/claudeAutomationPolicy.ts`. The output schema constrains generation; application validation prevents malformed tool input from reaching operational services.
 
 Saying "return valid JSON" is weaker than a typed schema plus external validation. Validate:
 
@@ -531,6 +802,38 @@ flowchart TB
     I --> T --> E --> M
 ```
 
+#### Code behind context retrieval and provenance
+
+The RAG client retrieves only context relevant to the current query, incident, and service:
+
+```ts
+async retrieveContext(params: {
+  query: string;
+  incidentNumber?: string;
+  service?: string;
+}): Promise<RAGContext | null> {
+  if (!this.enabled) return null;
+  const response = await this.client.post("/retrieve-context", params);
+  return response.data.success ? response.data.context : null;
+}
+```
+
+Used in: `services/ai-orchestrator/src/services/ragService.ts`. Observability context keeps time and source visible:
+
+```ts
+return [
+  `Generated: ${context.generatedAt}`,
+  `Service: ${context.service}`,
+  `Time range: last ${context.timeRangeMinutes} minutes`,
+  "Metrics:",
+  metrics || "No metrics available",
+  "Log findings:",
+  logs || "No log findings available",
+].join("\n");
+```
+
+Used in: `services/ai-orchestrator/src/services/observabilityFormatter.ts`. This lets the model distinguish fresh evidence from stale summaries.
+
 Use just-in-time retrieval. Preserve raw evidence for critical claims because summaries are lossy. Tag evidence with incident ID, source system, timestamp, retrieval query, and freshness. When sources conflict, expose the conflict rather than inventing certainty.
 
 OpsMind's RAG service retrieves incidents, logs, runbooks, tickets, and knowledge-base items. Its observability formatter preserves source names and time range. The AI Copilot distinguishes MCP+AI, fallback-provider, MCP-facts-only, and prompt-parser response sources in metadata.
@@ -546,6 +849,31 @@ flowchart TD
     Q -->|high impact or conflict| REVIEW[Human review]
     Q -->|unrecoverable| FAIL[Fail clearly and preserve diagnostics]
 ```
+
+#### Code behind provider fallback
+
+If the caller did not explicitly demand one provider, OpsMind tries only configured alternatives and records the original provider:
+
+```ts
+const fallbackCandidates = ["generic", "openai", "claude"];
+
+for (const candidateName of fallbackCandidates) {
+  if (candidateName === primaryName) continue;
+  const fallbackProvider = ProviderFactory.getProvider(candidateName, {
+    silent: true,
+  });
+  if (!fallbackProvider) continue;
+
+  try {
+    const response = await fallbackProvider.call(systemPrompt, userMessage);
+    return { response, fallbackFrom: primaryProvider.name };
+  } catch (fallbackError) {
+    fallbackErrors.push(`${fallbackProvider.name}: ${toErrorMessage(fallbackError)}`);
+  }
+}
+```
+
+Used in: `services/ai-orchestrator/src/services/llmFallbackService.ts`. Explicit provider selection disables automatic substitution, preserving the caller's intent. The Copilot service also labels facts-only and fallback responses in metadata rather than presenting degraded output as normal.
 
 Reliability controls include timeouts, bounded exponential retry, jitter, circuit breakers, idempotency, fallbacks, explicit degraded modes, audit trails, and human escalation.
 
@@ -611,6 +939,19 @@ flowchart LR
     APPROVE -->|Yes| ACT[Idempotent bounded action]
     ACT --> VERIFY[Verify SLO recovery]
 ```
+
+#### Project implementation used by this scenario
+
+The production automation prompt makes the evidence-before-action rule explicit, while code separately controls the write:
+
+```ts
+`You are the OpsMind production SRE automation agent.
+Gather the incident record and evidence before recommending action.
+Clearly distinguish facts from hypotheses.
+Do not persist changes unless the update tool is explicitly approved.`
+```
+
+Used in: `services/ai-orchestrator/src/services/opsIncidentAutomationService.ts`. In the scenario, `get_incident_details`, `analyze_incident_logs`, and `get_incident_metrics` supply the read path; `get_remediation_recommendations` supplies the plan; `update_incident_ai_insights` represents the approval-gated write. A real deployment rollback tool should follow the same contract but also include idempotency, validation, rollback, and audit fields.
 
 **Key answer points:** narrow read access; parallel independent evidence; sourced handoffs; no mutation without approval; bounded loop; validation after action; rollback/compensation path; audit metadata.
 
