@@ -713,3 +713,611 @@ You are exam-ready on this PDF when you can:
 - explain every wrong option, not merely remember the right one;
 - recreate the decision map from memory;
 - correctly choose among `CLAUDE.md`, settings/deny rules, commands, skills, subagents, hooks, SDK, and `-p` for a new scenario.
+
+---
+
+# Diagram Explanations and Example Codebase Structure
+
+This section converts the PDF's visual ideas into text diagrams and connects them to a realistic repository. Read each diagram from top to bottom in the direction of the arrows.
+
+## Diagram 1: The Claude Code Agentic Loop
+
+```text
+               User gives a goal
+                      |
+                      v
+              +---------------+
+              | 1. PLAN       |
+              | Choose a step |
+              +-------+-------+
+                      |
+                      v
+              +---------------+
+              | 2. ACT        |
+              | Call a tool   |
+              +-------+-------+
+                      |
+                      v
+              +---------------+
+              | 3. OBSERVE    |
+              | Read result   |
+              +-------+-------+
+                      |
+                Task complete?
+                 /          \
+               no            yes
+               |              |
+               +---> PLAN     +---> Final result
+```
+
+### What it means
+
+Claude Code does not have to solve a task in one response. Suppose the user says, “Fix the failing login test.” Claude may:
+
+1. plan to inspect the failing test;
+2. use Read to inspect it;
+3. observe that the expected status is `401`;
+4. inspect the login handler;
+5. edit the handler;
+6. run the test using Bash;
+7. observe whether the test passed;
+8. repeat if another failure appears.
+
+**Exam clue:** Words such as “repeatedly,” “observes the result,” or “continues until complete” point to the **agentic/planning loop**.
+
+## Diagram 2: Tools Inside the Loop
+
+```text
+                         +----------------+
+                         |  Claude Code   |
+                         +-------+--------+
+                                 |
+             +-------------------+-------------------+
+             |          |          |         |       |
+             v          v          v         v       v
+           Read       Write       Edit      Bash    Web
+        inspect a   create/full  targeted   execute  current
+           file       replace     change    command  facts
+                                 |
+                                 v
+                              Agent
+                        delegate an isolated,
+                           bounded subtask
+```
+
+### How to choose
+
+- “Look at this file” → Read.
+- “Create this new configuration” → Write.
+- “Change only this function” → Edit.
+- “Run tests/build/git” → Bash.
+- “Find the latest release” → Web.
+- “Investigate this independent area and report back” → Agent/subagent.
+
+The permission system checks a tool call before it is allowed to execute.
+
+## Diagram 3: Context Window
+
+```text
++----------------------------------------------------------+
+|                    CONTEXT WINDOW                        |
+|----------------------------------------------------------|
+| System and managed instructions                          |
+| User, project, local, and directory CLAUDE.md files      |
+| Current conversation                                     |
+| Files Claude has read                                    |
+| Shell output, test results, logs, and tool results       |
+| Plans, edits, and other working information              |
++----------------------------------------------------------+
+                 finite space: all items compete
+                              |
+                     when space becomes tight
+                              v
+                  +------------------------+
+                  | COMPACTION             |
+                  | Summarize older detail |
+                  +------------------------+
+```
+
+### Why this matters
+
+Loading a 500-line generic style guide leaves less space for source files and debugging output. Put only durable, behavior-changing instructions in `CLAUDE.md`; keep generated files, large logs, and unrelated documentation out of context.
+
+## Diagram 4: Permission and Hook Gates
+
+```text
+Claude proposes a tool call
+           |
+           v
++-------------------------+
+| Permission evaluation   |
+| mode + allow/deny rules |
++------------+------------+
+             |
+      denied | permitted
+       stop  | or approved
+             v
++-------------------------+
+| PreToolUse hook         |
+| exit 0 = continue       |
+| exit 2 = block          |
++------------+------------+
+             |
+             v
+       TOOL EXECUTES
+             |
+             v
++-------------------------+
+| PostToolUse hook        |
+| react, format, test, log|
++-------------------------+
+```
+
+### What the diagram teaches
+
+Permissions and hooks are related but different controls:
+
+- A permission mode decides whether Claude may perform an action automatically, must ask, or must deny it.
+- A deny rule blocks matching access.
+- A `PreToolUse` hook performs a deterministic last check before execution.
+- A `PostToolUse` hook runs after the side effect and therefore cannot prevent it.
+
+**Exam trap:** If damage must be prevented, the answer cannot be `PostToolUse`.
+
+## Diagram 5: `CLAUDE.md` Scope
+
+```text
+Broadest
+   |
+   v
++-------------------------------+
+| Managed policy                |  company-wide requirements
++-------------------------------+
+| User CLAUDE.md                |  one person's cross-project preferences
++-------------------------------+
+| Project CLAUDE.md             |  shared repository standards
++-------------------------------+
+| CLAUDE.local.md               |  private notes for this user and repo
++-------------------------------+
+   |
+   v
+Narrowest
+
+When Claude reads src/frontend/Button.tsx:
+
+Project CLAUDE.md
+        +
+src/frontend/CLAUDE.md
+        =
+global project rules plus frontend-specific rules
+```
+
+### The important detail
+
+This is an **additive instruction hierarchy**, not a guaranteed “last file wins” system. Avoid contradictions. A child `CLAUDE.md` adds focused guidance when Claude reads within that directory.
+
+## Diagram 6: Commands, Skills, and Subagents
+
+```text
+Need instructions for Claude
+            |
+            v
+Does the rule apply throughout ordinary project work?
+       / yes                         \ no
+      v                               v
+ CLAUDE.md                  Is it a reusable workflow?
+                                  / yes       \ no
+                                 v             v
+                        Command or Skill    ordinary prompt
+                              |
+            +-----------------+------------------+
+            |                                    |
+    short/manual template              richer instruction package
+      slash command                           skill
+
+Need isolated delegated work with its own context?
+                         |
+                        yes
+                         v
+                     subagent
+```
+
+### Quick interpretation
+
+- `CLAUDE.md`: always-on standards.
+- Command: reusable user-invoked prompt, such as `/review-api 184`.
+- Skill: reusable packaged expertise with instructions and possibly supporting files.
+- Subagent: a separate worker that needs an explicit task, context, constraints, and output contract.
+
+## Diagram 7: Plan Mode Approval Flow
+
+```text
+Complex or risky request
+          |
+          v
+    Enter plan mode
+          |
+          v
+ Read files and investigate
+          |
+          v
+     Propose a plan
+          |
+          v
+ User reviews files, steps,
+ tests, risks, and assumptions
+       /              \
+ revise                approve
+   |                      |
+   +--> improve plan      v
+                    execution mode
+                           |
+                           v
+                    edit and validate
+```
+
+Approval is not a formality. It is the control point between read-only investigation and mutation.
+
+## Diagram 8: SDK and CI/CD
+
+```text
+Human at terminal                    Application or pipeline
+       |                                      |
+       v                                      v
+Claude Code CLI                       Agent SDK / claude -p
+       |                                      |
+       +---------------+----------------------+
+                       v
+               agentic execution loop
+                       |
+                       v
+              tool events and output
+
+CI/CD safe path:
+
+secret store --> API credential
+pipeline     --> claude -p "atomic task"
+permissions  --> minimum required tools
+stdout       --> JSON validation/parsing
+exit code    --> pass or fail pipeline
+timeout      --> stop runaway execution
+```
+
+The CLI and SDK expose similar agentic power through different control surfaces. A human normally drives the interactive CLI; code drives the SDK or a non-interactive `-p` run.
+
+---
+
+## Complete Example Codebase Structure
+
+The following fictional project shows where each configuration mechanism belongs:
+
+```text
+secure-shop/
+|
++-- CLAUDE.md                         # Shared root project instructions
++-- CLAUDE.local.md                   # Personal repo notes; gitignored
++-- .gitignore
++-- package.json
++-- README.md
+|
++-- .claude/
+|   +-- settings.json                 # Shared permissions and hooks
+|   +-- settings.local.json           # Personal settings; gitignored
+|   |
+|   +-- commands/
+|   |   +-- review-api.md             # Invoked as /review-api
+|   |   +-- run-feature-check.md      # Invoked as /run-feature-check
+|   |
+|   +-- skills/
+|   |   +-- api-security-review/
+|   |       +-- SKILL.md              # Reusable specialist instructions
+|   |       +-- checklist.md          # Supporting skill reference
+|   |
+|   +-- agents/
+|       +-- test-reviewer.md           # Example custom subagent definition
+|
++-- hooks/
+|   +-- block-destructive-command.js  # PreToolUse safety check
+|   +-- format-after-edit.js           # PostToolUse automation
+|
++-- src/
+|   +-- backend/
+|   |   +-- CLAUDE.md                  # Backend-only conventions
+|   |   +-- routes/
+|   |   |   +-- login.ts
+|   |   +-- services/
+|   |       +-- auth.ts
+|   |
+|   +-- frontend/
+|       +-- CLAUDE.md                  # Frontend-only conventions
+|       +-- components/
+|           +-- LoginForm.tsx
+|
++-- tests/
+|   +-- CLAUDE.md                      # Test-only conventions
+|   +-- auth.test.ts
+|
++-- generated/
+|   +-- CLAUDE.md                      # Do-not-edit warning
+|   +-- api-client.ts
+|
++-- secrets/                           # Denied to Claude Code
+    +-- production-key.pem
+```
+
+### How Claude processes this structure
+
+If Claude starts at `secure-shop/`, the root `CLAUDE.md` provides shared behavior. When it reads `src/frontend/components/LoginForm.tsx`, the frontend `CLAUDE.md` is added. When it later reads `tests/auth.test.ts`, the test-specific instructions are added. A Read deny rule should prevent access to `secrets/` regardless of a prompt asking Claude to inspect it.
+
+---
+
+## Example Root `CLAUDE.md`
+
+```markdown
+# Secure Shop Project Instructions
+
+## Commands
+
+- Install dependencies with `npm ci`.
+- Run the complete test suite with `npm test`.
+- Run linting with `npm run lint`.
+
+## Architecture
+
+- Keep HTTP routing in `src/backend/routes`.
+- Keep business logic in `src/backend/services`.
+- Do not import frontend modules from backend code.
+
+## Required validation
+
+- After changing TypeScript, run `npm run lint`.
+- Run the smallest relevant test suite before the full suite.
+
+## Security
+
+- Never place credentials or tokens in source code.
+- Never modify files under `generated/` manually.
+```
+
+Why this works: it contains precise repository commands, architecture boundaries, validation steps, and security constraints. It avoids generic instructions such as “write high-quality code.”
+
+## Example Frontend-Scoped `CLAUDE.md`
+
+Location: `src/frontend/CLAUDE.md`
+
+```markdown
+# Frontend Instructions
+
+- Name React components in PascalCase.
+- Name custom hooks with the `use` prefix.
+- Co-locate each component test with its component.
+- Use the shared design tokens; do not insert literal color values.
+- Run `npm test -- frontend` after frontend changes.
+```
+
+These instructions apply in addition to the root project instructions when Claude reads frontend files.
+
+## Example Backend-Scoped `CLAUDE.md`
+
+Location: `src/backend/CLAUDE.md`
+
+```markdown
+# Backend Instructions
+
+- Route handlers validate input and delegate business logic to services.
+- Return the standard error object: `{ "error": { "code": "...", "message": "..." } }`.
+- Add authentication-failure and validation-failure tests for every endpoint change.
+- Never log passwords, tokens, session identifiers, or full request bodies.
+```
+
+## Example Generated-Code `CLAUDE.md`
+
+Location: `generated/CLAUDE.md`
+
+```markdown
+# Generated Files
+
+- Do not edit files in this directory.
+- Regenerate them with `npm run generate-client`.
+- Make required changes in the source schema, then run the generator.
+```
+
+This is an instruction-level safeguard. For stronger enforcement, also use permissions or a `PreToolUse` hook.
+
+## Example Permission and Hook Settings
+
+Location: `.claude/settings.json`
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Read(src/**)",
+      "Read(tests/**)",
+      "Bash(npm test:*)",
+      "Bash(npm run lint:*)"
+    ],
+    "deny": [
+      "Read(.env)",
+      "Read(.env.*)",
+      "Read(secrets/**)",
+      "Read(**/*.pem)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node hooks/block-destructive-command.js"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node hooks/format-after-edit.js"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+This example is conceptual and based on the PDF's configuration model. Exact keys and matcher syntax should be checked against the installed Claude Code version.
+
+### Reading the example
+
+- The allow list permits source/test reads and selected npm commands.
+- The deny list protects environment files, the secrets tree, and PEM keys.
+- `PreToolUse` inspects Bash before execution.
+- `PostToolUse` formats content after Edit or Write.
+- A matching deny still beats an allow.
+
+## Example Slash Command
+
+Location: `.claude/commands/review-api.md`
+
+```markdown
+Review API endpoint: $ARGUMENTS
+
+1. Identify its route handler and service implementation.
+2. Check input validation, authentication, authorization, and error handling.
+3. Check tests for success, authentication failure, authorization failure,
+   and invalid input.
+4. Do not modify files.
+5. Return findings as a table with severity, file, issue, and recommendation.
+```
+
+Invoking `/review-api POST /login` substitutes `POST /login` for `$ARGUMENTS`.
+
+## Example Skill
+
+Location: `.claude/skills/api-security-review/SKILL.md`
+
+```markdown
+---
+name: api-security-review
+description: Review API endpoint changes for authentication, authorization,
+  input validation, secret exposure, and unsafe logging.
+---
+
+# API Security Review
+
+Use `checklist.md` as the review sequence.
+
+For every finding, report:
+
+- severity: critical, high, medium, or low;
+- evidence: exact file and relevant behavior;
+- impact: what an attacker or user could cause;
+- remediation: the smallest safe correction;
+- verification: a test that proves the correction.
+
+Do not claim a vulnerability without code evidence.
+```
+
+The description clearly states when the skill is relevant. The body defines a reliable output contract, and the adjacent checklist provides supporting knowledge.
+
+## Example Subagent Handoff
+
+```text
+Task:
+Review only the authentication tests for missing cases.
+
+Context:
+- Implementation: src/backend/services/auth.ts
+- Tests: tests/auth.test.ts
+- Expected status for invalid credentials: 401
+
+Constraints:
+- Do not edit files.
+- Do not inspect secrets/ or environment files.
+- Report only evidence visible in the supplied files.
+
+Output:
+Return a Markdown table with columns:
+Priority | Missing case | Evidence | Proposed test name
+
+Failure behavior:
+If either required file cannot be read, report BLOCKED and name the file.
+```
+
+This handoff succeeds because it defines task, context, constraints, output, and failure reporting. “Please review authentication” would be too vague.
+
+## Example PreToolUse Hook Logic
+
+The conceptual flow for `hooks/block-destructive-command.js` is:
+
+```text
+Read JSON tool context from stdin
+             |
+             v
+Is the tool Bash?
+       / no       \ yes
+   exit 0          inspect command
+                         |
+            contains destructive pattern?
+                   / no        \ yes
+               exit 0           write reason to stderr
+                                      |
+                                    exit 2
+```
+
+Use an allowlist where practical because a blocklist can miss spelling, quoting, aliases, or new destructive commands. Test safe, unsafe, and malformed inputs before enabling enforcement.
+
+## Example CI/CD Shape
+
+```yaml
+steps:
+  - name: Claude review
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    run: >-
+      claude -p
+      --output-format json
+      "Review the changed TypeScript files. Do not edit. Return valid JSON."
+```
+
+For a real pipeline, additionally set the minimum tool allowlist, validate the JSON schema, impose a timeout, and fail on a nonzero exit code. Exact CLI flags should be confirmed for the installed version.
+
+---
+
+## Codebase-Structure Scenario Questions
+
+### 46. Claude reads `src/frontend/components/LoginForm.tsx`. Which project instructions should affect it?
+
+**Answer:** The root project `CLAUDE.md` plus `src/frontend/CLAUDE.md`, along with applicable managed, user, and local context.
+
+**Explanation:** Directory-scoped guidance augments the broader instructions when a file in that directory is read.
+
+### 47. The backend team rule is accidentally placed in one developer's `CLAUDE.local.md`. What is the consequence?
+
+**Answer:** Other contributors will not reliably receive the rule.
+
+**Explanation:** Shared standards belong in a version-controlled project or directory-scoped `CLAUDE.md`.
+
+### 48. The generated folder says “do not edit,” but the organization needs deterministic blocking. What should be added?
+
+**Answer:** A suitable permission restriction or `PreToolUse` enforcement hook.
+
+**Explanation:** Natural-language instructions guide behavior; deterministic controls enforce it before a tool action.
+
+### 49. A security review is repeated, has a checklist, and should return the same schema every time. Which mechanism is best?
+
+**Answer:** A skill.
+
+**Explanation:** It is a recurring specialized workflow with supporting resources and a defined output contract.
+
+### 50. The pipeline runs Claude successfully but downstream parsing fails intermittently. What configuration improvements help?
+
+**Answer:** Request structured JSON, validate its schema, make the prompt atomic and explicit, check exit codes, and set a timeout.
+
+**Explanation:** Automation must treat model output as data requiring validation, not assume that any stdout is structurally correct.
